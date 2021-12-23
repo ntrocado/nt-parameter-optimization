@@ -2,70 +2,89 @@
 
 (in-package #:parameter-optimization)
 
-(defstruct gdist
+(defstruct variate
   mu
   sigma
   weight)
 
-(defparameter *gdists*
-  (loop :repeat 2 :collect (make-gdist :mu 5d0 :sigma 2d0 :weight .5)))
+(defun create-pdf (n-variates mu sigma)
+  (loop :repeat n-variates
+	:collect (make-variate :mu mu :sigma sigma :weight (/ 1 n-variates))))
 
-(defun incw (n &optional (factor 1.1) (limit .7))
-  (let* ((new-w (min (* (gdist-weight (nth n *gdists*))
-			factor)
-		     limit))
-	 (other-w (- 1 new-w)))
-    (if (zerop n)
-	(setf (gdist-weight (nth 0 *gdists*)) new-w
-	      (gdist-weight (nth 1 *gdists*)) other-w)
-	(setf (gdist-weight (nth 0 *gdists*)) other-w
-	      (gdist-weight (nth 1 *gdists*)) new-w))))
+(defun mu-score-factor (score)
+  (ecase score
+    (1 -.3)
+    (2 0.15)
+    (3 0)
+    (4 .6)
+    (5 .9)))
 
-(defun choose-gdist ()
+(defun sigma-score-factor (score)
+  (ecase score
+    (1 1.15)
+    (2 1.05)
+    (3 1)
+    (4 .75)
+    (5 .3)))
+
+(defun new-mu (var score last-try)
+  (let ((mu (variate-mu var)))
+    (- mu
+       (* (mu-score-factor score)
+	  (- mu last-try)))))
+
+;;;TODO: when score is high but new mu is far from previous mu, sigma shouldn't decrease
+(defun new-sigma (var score)
+  (* (variate-sigma var)
+     (sigma-score-factor score)))
+
+(defun new-weight (pdf var last-try)
+  (if (eq var (first (sort (copy-seq pdf) #'< :key (lambda (x)
+						     (abs (- last-try
+							     (variate-mu x)))))))
+      (min .7 (* (variate-weight var) 1.1))
+      (max .1 (* (variate-weight var) .9))))
+
+(defun choose-variate (pdf)
   (funcall (randist:make-discrete-random-var
-	    (coerce (mapcar #'gdist-weight *gdists*) 'vector)
-	    #(0 1))))
+	    (coerce (mapcar #'variate-weight pdf) 'vector)
+	    (coerce pdf 'vector))))
 
-(defun draw (gdist)
-  (randist:random-normal (gdist-mu gdist) (gdist-sigma gdist)))
+(defun new-pdf (pdf score last-try active)
+  (substitute (make-variate :mu (new-mu active score last-try)
+			    :sigma (new-sigma active score)
+			    :weight (new-weight pdf active last-try))
+	      active
+	      pdf))
 
-(defun update (gdist score try)
-  (setf (gdist-mu gdist) (- (gdist-mu gdist) (* (ecase score
-						  (1 -.3)
-						  (2 0.15)
-						  (3 0)
-						  (4 .6)
-						  (5 .9))
-						(- (gdist-mu gdist) try)))
-	(gdist-sigma gdist) (let ((factor (ecase score
-					    (1 1.15 ;1.35
-					     )
-					    (2 1.05 ;1.17
-					     )
-					    (3 1)
-					    (4 .75)
-					    (5 .3))))
-			      (* (gdist-sigma gdist) factor))))
+(defun draw (var)
+  (randist:random-normal (coerce (variate-mu var) 'double-float)
+			 (coerce (variate-sigma var) 'double-float)))
 
-(defun print-stuff (active-n try)
-  (progn (print *gdists*) (print active-n) (print try) (force-output)))
+(defmacro opt ((parameters &key (verbose nil) (limit nil)) &body body)
+  "Optimize PARAMETERS, a list of the form:
 
-(defun main (&key (test nil))
-  (loop :for i :upto 10
-	:for active-n := (choose-gdist)
-	:for try := (draw (nth active-n *gdists*))
-	:for score := (progn (print-stuff active-n try)
-			     (if test
-				 (print (case (truncate try)
-					  ((-2 4 6 12) 2)
-					  ((-1 3 7 11) 3)
-					  ((0 2 8 10) 4)
-					  ((1 9) 5)
-					  (t 1)))
-				 (read))) 
-	:for nearest := (if (<= (abs (- try (gdist-mu (nth 0 *gdists*))))
-				(abs (- try (gdist-mu (nth 1 *gdists*)))))
-			    0 1)
-	:while (plusp score)
-	:do (update (nth active-n *gdists*) score try)
-	:do (incw nearest)))
+ ((parameter-1 number-of-vars-1 mean-1 std-dev-1)
+  (parameter-2 number-of-vars-2 mean-2 std-dev-2)
+  ...
+  (parameter-n number-of-vars-n mean-n std-dev-n))
+
+For each parameter, all variates are initialized with the same given mean and standard deviation.
+
+Repeatedly execute BODY, each time binding the parameters to new values and reading a score from the user. The score must be a number between 1 (bad match) and 5 (perfect match), or 0, which stops immediately. If LIMIT is set, execution only continues for that maximum number of tries."
+  (alexandria:with-gensyms (score n)
+    (let ((for-clauses (mapcan (lambda (parm)
+				 (alexandria:with-gensyms (pdf-name active-name)
+				   `(:for ,pdf-name := (create-pdf ,(second parm) ,(third parm) ,(fourth parm))
+				     :then (new-pdf ,pdf-name ,score ,(first parm) ,active-name)
+				     :for ,active-name := (choose-variate ,pdf-name)
+				     :for ,(first parm) := (draw ,active-name)
+				     :for ,(gensym) := ,(when verbose
+							  `(format t "~a~%pdf: ~a~%"
+								   ,(symbol-name (first parm))
+								   ,pdf-name)))))
+			       parameters)))
+      `(loop :for ,n :from 1
+	     ,@for-clauses
+	     :for ,score := (progn ,@body (read))
+	     :until (or (zerop ,score) (and ,limit (= ,n ,limit)))))))

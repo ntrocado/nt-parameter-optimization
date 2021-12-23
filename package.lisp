@@ -1,4 +1,6 @@
 ;;;; package.lisp
 
 (defpackage #:parameter-optimization
-  (:use #:cl))
+  (:use #:cl)
+  (:export
+   #:opt))
